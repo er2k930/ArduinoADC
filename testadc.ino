@@ -1,5 +1,5 @@
 // Copyright 2025 Dmitry Ivanov
-// v.1.0
+// v.1.1
 
 // Flag for processing timer interrupts
 volatile bool oneSecFlag = false;
@@ -7,7 +7,7 @@ volatile bool oneSecFlag = false;
 // Compare value for Timer1
 constexpr uint16_t CMP_VAL_T1 = 16000000 / 1024 * 1 - 1;   // (16MHz / 1024 prescaler) * 1s - 1
 
-// String to store recieved data from USART
+// String to store recieved data from UART
 String incomingString = "";
 
 // Control commands
@@ -15,13 +15,15 @@ String CMD_START_EXT  = "STE";
 String CMD_START_INT  = "STI";
 String CMD_STOP       = "OFF";
 String CMD_CALIBRATE  = "CAL";
+String CMD_FILTER     = "FIL";
 
-// USART baudrate
+// UART baudrate
 #define BAUDRATE 9600
 
 // Flags to determine current state
 bool isActive            = false;
 bool isInCalibrationMode = false;
+bool filter              = true;
 
 // Precise values of external and internal Uref
 #define UREF_EXT_VAL 4.980
@@ -34,10 +36,13 @@ float urefValue = 0.0;
 const int R1 = 9310;
 const int R2 = 816;
 
-// Calibration value
-float calibValue = 1.0;
+// Calibration values
+float calibValueK = 1.0;
+float calibValueB = 0.0;
 
 // Last measured voltage
+float measure = 0.0;
+// Filtered voltage
 float voltage = 0.0;
 
 // Pin number measuring voltage
@@ -61,28 +66,29 @@ void setup()
 
   sei();
 
-  printHelpUSART();
+  printHelpUART();
 }
 
-// Print initial information in the USART
-void printHelpUSART()
+// Print initial information in the UART
+void printHelpUART()
 {
-  Serial.println("[OK] Ready! List of available commands:");
-  Serial.println("STE -> Start measuring with external Uref");
-  Serial.println("STI -> Start measuring with internal Uref");
-  Serial.println("OFF -> Stop measuring");
-  Serial.println("CAL -> Perform calibration");
+  Serial.println("[v] Готов. Список доступных команд:");
+  Serial.println("  STE -> Запуск измерения с внешним Uоп");
+  Serial.println("  STI -> Запуск измерения с внутренним Uоп");
+  Serial.println("  OFF -> Остановка");
+  Serial.println("  CAL -> Выполнение калибровки");
+  Serial.println("  FIL -> Вкл/выкл цифровой фильтр");
 }
 
-// Recieve commands from the USART
-void recieveCommandUSART()
+// Receive commands from the UART
+void receiveCommandUART()
 {
   while (Serial.available() > 0) {
     incomingString = Serial.readStringUntil('\n');
   }
   
   if (incomingString == CMD_START_EXT) {
-    Serial.println("[OK] Starting with EXTERNAL Uref...");
+    Serial.println("[v] Запуск с ВНЕШНИМ Uоп...");
     isActive = true;
     isInCalibrationMode = false;
     delay(1000);
@@ -90,7 +96,8 @@ void recieveCommandUSART()
     delay(1000);
     urefValue = UREF_EXT_VAL;
   } else if (incomingString == CMD_START_INT) {
-    Serial.println("[OK] Starting with INTERNAL Uref...");
+    Serial.println("[v] Запуск с ВНУТРЕННИМ Uоп...");
+    Serial.println("[!] ЗАПРЕЩАЕТСЯ ПОДАВАТЬ НА АЦП БОЛЬШЕ 12 ВОЛЬТ!");
     isActive = true;
     isInCalibrationMode = false;
     delay(1000);
@@ -100,46 +107,66 @@ void recieveCommandUSART()
   } else if (incomingString == CMD_STOP) {
     isActive = false;
     isInCalibrationMode = false;
-    Serial.println("[OK] Stopped");
-    printHelpUSART();
+    Serial.println("[v] Остановлено");
+    delay(1000);
+    analogReference(DEFAULT);
+    delay(1000);
+    printHelpUART();
   } else if (incomingString == CMD_CALIBRATE) {
     isActive = false;
     isInCalibrationMode = true;
-    Serial.println("[OK] Starting calibration mode...");
+    Serial.println("[v] Запуск режима калибровки...");
+    delay(1000);
+    analogReference(DEFAULT);
+    delay(1000);
     performCalibration();
-  }
-  else if (incomingString != "") {
-    Serial.println("[WARNING] Invalid command");
+  } else if (incomingString == CMD_FILTER) {
+    filter = !filter;
+    if (filter) {
+      Serial.println("[v] Цифровой фильтр включен");
+    } else {
+      Serial.println("[v] Цифровой фильтр выключен");
+    }
+  } else if (incomingString != "") {
+    Serial.println("[x] Неверная команда");
   }
   
   incomingString = "";                
 }
 
-// Print voltage values in USART
-void printADCValUSART()
+// Print voltage values in UART
+void printADCValUART()
 {
   if (isActive && !isInCalibrationMode) {
     Serial.print("U = ");
-    Serial.println(voltage);
+    Serial.println(voltage, 3);
   }
 }
 
-// Get and set new calibration value
+// Get and set new calibration values
 void performCalibration()
 {
-  calibValue = 1.0;
-  Serial.println("[CAL] Enter new calibration value (in %)");
-  Serial.println("[CAL] Use '.' as a decimal separator");
-  Serial.println("[CAL] >>> ");
+  Serial.setTimeout(60000);
+  Serial.println("[!] Передаточная характеристика АЦП представима как уравнение вида:");
+  Serial.println("    Uацп = k * Uфакт + b");
+  Serial.println("Введите калибровочные коэффициенты k и b");
+  Serial.println("Используйте '.' в качестве десятичного разделителя");
+  Serial.println(">>> k = ");
   while (isInCalibrationMode) {
     if (Serial.available() > 0) {
-      float cal = Serial.parseFloat();
-      calibValue = calibValue * (1 + cal/100.0);
-      Serial.print("[OK] New calibration value set: ");
-      Serial.print(cal);
-      Serial.println("%");
-      printHelpUSART();
-      isInCalibrationMode = false;
+      calibValueK = Serial.parseFloat();
+      Serial.println(calibValueK);
+      Serial.println(">>> b = ");
+      while (isInCalibrationMode) {
+        if (Serial.available() > 0) {
+          calibValueB = Serial.parseFloat();
+          Serial.println(calibValueB);
+          Serial.println("[v] Новые калибровочные коэффициенты установлены");
+          printHelpUART();
+          isInCalibrationMode = false;
+          Serial.setTimeout(1000);
+        }
+      }
     }
   }
 }
@@ -147,15 +174,24 @@ void performCalibration()
 void loop() 
 {
   if (isActive && !isInCalibrationMode) {
-    voltage = (float)analogRead(U_PIN) * calibValue * urefValue * ((R1 + R2) / R2) / 1024.0;
+    if (filter) {
+      for (int i = 0; i < 100; ++i) {
+        measure += (float)analogRead(U_PIN) * calibValueK * urefValue * ((R1 + R2) / R2) / 1024.0 + calibValueB;
+      }
+      voltage = measure / 100.0;
+      measure = 0;
+    } else {
+      measure = (float)analogRead(U_PIN) * calibValueK * urefValue * ((R1 + R2) / R2) / 1024.0 + calibValueB;
+      voltage = measure;
+    }
   }
 
   if (oneSecFlag) {
     oneSecFlag = false;
-    printADCValUSART();
+    printADCValUART();
   }
 
-  recieveCommandUSART();
+  receiveCommandUART();
 }
 
 // Interrupt service routine for 1s
